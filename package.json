@@ -1,0 +1,42 @@
+{
+  "name": "dsh-model-info",
+  "version": "0.1.0",
+  "description": "Model metadata overlay for DeepSeek Harness (dsh): exposes each CodeBuddy model's upstream credit multiplier (0x rate) and zero-billing flag, and injects that extra information next to the model name in the web UI.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "codebuddy",
+    "model",
+    "credits",
+    "multiplier"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  }
+}

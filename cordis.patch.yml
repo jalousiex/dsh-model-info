@@ -1,0 +1,15 @@
+# dsh-model-info — per-model metadata overlay (credit multiplier, zero-billing flag)
+#
+# Inserts this package into the profile's plugin entry list so cordis loads
+# index.js (host half: fetches the upstream catalog, serves a loopback route)
+# and makes the browser half (lib/client.js) available to the web module
+# loader, which injects the extra model information into the UI.
+#
+# Dependency: reads the CodeBuddy OAuth token dsh-tap stores in
+# ~/.dsh/codebuddy-plugin-auth.json. Without dsh-tap logged in the route
+# reports available:false and the UI simply shows no badges — it never
+# blocks startup.
+
+- insert:
+    - id: dsh-model-info
+      name: 'dsh-model-info'
