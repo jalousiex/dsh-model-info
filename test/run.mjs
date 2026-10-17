@@ -227,7 +227,7 @@ ok('tooltip has rate', tip.includes('0.29x'))
 ok('tooltip has trial', tip.includes('试用 14 天'))
 ok('tooltip has description', tip.includes('混元思考模型'))
 ok('tooltip has context', tip.includes('960K'))
-ok('tooltip has efforts', tip.includes('思考档 high'))
+ok('tooltip has efforts', tip.includes('思考强度：high'))
 
 console.log('client static discipline:')
 ok('does not observe class', !/attributeFilter:\s*\[\s*["']class["']\s*\]/.test(clientSource))
