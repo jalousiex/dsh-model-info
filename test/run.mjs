@@ -234,7 +234,7 @@ ok('does not observe class', !/attributeFilter:\s*\[\s*["']class["']\s*\]/.test(
 ok('narrow attributeFilter only', /attributeFilter:\s*\[\s*"aria-label",\s*"aria-checked",\s*"aria-expanded"\s*\]/.test(clientSource))
 const onMutationsBody = clientSource.slice(
   clientSource.indexOf('function onMutations'),
-  clientSource.indexOf('// One full pass at install'),
+  clientSource.indexOf('安装时做一次整页扫描'),
 )
 ok('mutation callback inspects no whole document', onMutationsBody.length > 0 && !/document\.querySelectorAll/.test(onMutationsBody))
 ok('mutation callback decorates only added subtrees', /collect\(rec\.addedNodes\[j\]\)/.test(onMutationsBody))
