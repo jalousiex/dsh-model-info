@@ -238,6 +238,9 @@ const onMutationsBody = clientSource.slice(
 )
 ok('mutation callback inspects no whole document', onMutationsBody.length > 0 && !/document\.querySelectorAll/.test(onMutationsBody))
 ok('mutation callback decorates only added subtrees', /collect\(rec\.addedNodes\[j\]\)/.test(onMutationsBody))
+ok('row badge goes into the option row, not the name cell', /target\.insertBefore\(node, check\)/.test(clientSource) && !/parent\.appendChild\(node\)/.test(clientSource))
+ok('row badge right-aligns itself', /node\.style\.marginLeft = "auto"/.test(clientSource))
+ok('unused dmi-row wrapper is gone', !/\.dmi-row\{/.test(clientSource))
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exitCode = fail === 0 ? 0 : 1
