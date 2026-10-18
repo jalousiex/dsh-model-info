@@ -134,6 +134,23 @@ connections).
 （`max-width:100%` 保住长名的省略号截断）。行高与「整行可点」都不变，徽标插在它
 后面、不进热区。
 
+两个踩过的坑，都写在这一行 CSS 上：
+
+- **不能加 `flex:none`**：触发器标签靠 `flex-shrink` 收缩才能出省略号，加了它触发器
+  会被撑破。
+- **没徽标时也必须留热区**：图片模型上游不给 `credits`，一个徽标都没有。之前「没徽标
+  就不建热区」，再叠加摘掉宿主原生 `title`，悬浮入口就整个没了 —— 这就是「详细提示
+  消失」的直接原因。热区现在只取决于「这个模型认不认得出来」，与有没有徽标无关。
+
+## 同名条目按 `data-model-id` 区分，不按名字
+
+`DeepSeek 账号` 与 `CodeBuddy` 两个分组里都有 `DeepSeek-V4-Pro`：显示名一样，却是
+不同条目、倍率也不同。只按名字解析会把一个分组的倍率贴到另一个分组的行上。
+
+所以解析顺序是：先取宿主写在行上的 `data-model-id`（权威），取不到才退回文本；退回
+文本时，只有当这个显示名在**整份目录里只出现一次**才认 —— 重名一律放弃，宁可这一行
+没有额外信息，也不串组。
+
 ## 模型顺序：只把 `auto` 钉到分组首位
 
 模型顺序是**宿主目录的顺序**（`orderModelProviders` 只排分组，`rankByName` 在查询
@@ -163,9 +180,11 @@ Mounting and lookup details that bite:
 
 - a badge goes on the **row container** (`[class*="_modelOption"]`), never inside `_optionCopy` —
   that one is the vertical name+description column, so anything inserted there wraps and stretches;
-- lookup is **by model id first**: display names can repeat across ids, so a name is never resolved
-  to a model; the one exception is a name followed by the shell's own marker (the `1017` release
-  badge renders `DeepSeek-V4.1-Flash 1017`), which matches its model by **unique** name prefix —
+- lookup is **by `data-model-id` first** (the shell writes it on every row): provider groups repeat
+  display names (`DeepSeek-V4-Pro` exists under both `DeepSeek 账号` and `CodeBuddy`), so a name
+  alone never resolves a model; falling back to text, only a display name that occurs **once in the
+  whole catalogue** resolves, and the one extra case is a name followed by the shell's own marker
+  (the `1017` release badge renders `DeepSeek-V4.1-Flash 1017`), matched by unique name prefix —
   otherwise that row would carry no extra information at all;
 - one row = one line: at most two compact in-row badges (`免费` or rate, each ≤6 chars), and the rest
   (描述 / 上下文 / 思考档 / 标签 / 试用 / 活动说明) lives in the hover card, not in the row —

@@ -398,6 +398,22 @@ check('带截止日', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily:
 ok('纯文本 tip 列出活动', client.tooltip(glm).includes('每晚 23:00'))
 ok('纯文本 tip 带消耗速度', client.tooltip(glm).includes('0.79x'))
 
+console.log('client provider scoping:')
+// 两个分组常有同名条目（DeepSeek 账号 与 CodeBuddy 都有 DeepSeek-V4-Pro），
+// 名字一样却是不同条目 —— 一个分组的倍率绝不能贴到另一个分组的同名行上。
+// `data-model-id` 是宿主写下的权威 id，只有它能区分两者。
+client.indexModels([
+  { id: 'v4pro-account', name: 'DeepSeek-V4-Pro', rate: 0.51, free: false },
+  { id: 'v4pro-codebuddy', name: 'DeepSeek-V4-Pro', rate: 1.25, free: false },
+  { id: 'uniq', name: 'Only-One', rate: 0.2, free: false },
+])
+const byId = (id) => ({ getAttribute: (name) => (name === 'data-model-id' ? id : null) })
+ok('按 data-model-id 取各自的倍率', client.lookup('DeepSeek-V4-Pro', byId('v4pro-account')).rate === '0.51x')
+ok('同名另一条取它自己的倍率', client.lookup('DeepSeek-V4-Pro', byId('v4pro-codebuddy')).rate === '1.25x')
+ok('id 查不到时退回文本', client.lookup('Only-One', byId('nope')).rate === '0.2x')
+ok('同名且 id 查不到时不乱挂', client.lookup('DeepSeek-V4-Pro', byId('nope')) === null)
+ok('没有 host 时按文本解析（老形状）', client.lookup('Only-One').rate === '0.2x')
+
 console.log('client lookup fallback:')
 // 宿主会在名字后面追加自己的标记（如 "DeepSeek-V4.1-Flash 1017"），
 // 整串既不是 id 也不是目录里的名字 —— 否则这一行就完全没有额外信息。
@@ -409,6 +425,13 @@ ok('名字 + 宿主标记也能命中', client.lookup('DeepSeek-V4.1-Flash 1017'
 ok('名字后接中文标记也能命中', client.lookup('DeepSeek-V4.1-Flash 推荐').id === 'deepseek-v4.1-flash')
 ok('不会被另一个模型名的前缀带走', client.lookup('Hy4 preview 1017').id === 'hy4-preview')
 ok('无关文本不命中', client.lookup('随便什么') === null)
+
+console.log('client hot zone:')
+// 没有徽标可挂时（图片模型上游不给 credits）热区也必须留着 —— 悬浮卡里还有
+// 描述 / 上下文 / 思考档，不能因为没徽标就让「详细提示」整个消失。
+// 摘掉宿主原生 title 之后，热区是唯一的悬浮入口，这就是它消失的原因。
+ok('没有徽标也建热区', /if \(!nodes\.length\)[\s\S]{0,400}?hot\.setAttribute\(ANCHOR, ""\)/.test(clientSource))
+ok('没有徽标时清掉的只是徽标，不是热区', !/if \(!nodes\.length\)[\s\S]{0,300}?clearHot\(hot\)/.test(clientSource))
 
 console.log('client static discipline:')
 ok('自绘悬浮卡（不用原生 title 排版）', /\.dmi-tip\{/.test(clientSource) && !/rec\.tip\s*=\s*tooltip/.test(clientSource))
