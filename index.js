@@ -1,4 +1,4 @@
-/**
+﻿/**
  * dsh-model-info —— 宿主半（host half）。
  *
  * 职责：暴露 CodeBuddy 网关**发布了但 dsh-tap 丢掉**的每模型元信息：
@@ -38,10 +38,37 @@
  * 因此我们同时给出原始字符串、解析后的数字和 `free` 布尔值，
  * 但绝不宣称「贵 N 倍」。
  *
- * 营销标签（`限时免费` / `夜间免费` / `订阅优先` …）在我们探测过的所有
- * X-Product 头（CLI/CodeBuddy/IDE/WorkBuddy/CodeBuddyDesktop）的 /v3/config 里都不存在，
- * 本机官方客户端包中也没有；**我们不编造它们**。
- * 只输出载荷真的携带的字段（`tags`、试用横幅、`craft` agent 模型集合）。
+ * ## 促销标签（`限时免费` / `夜间免费` / `夜间折扣` / `独家限免` / `订阅优先`）
+ *
+ * 早期结论是"网关不发布它们"，**该结论已被推翻**：`/v3/config` 的载荷**按
+ * `User-Agent` 里的产品名分发行情**——同一个 token、同一个 URL，UA 不同，
+ * `data` 的键集合与模型条数都不同（2026-10-17 实测）：
+ *
+ * | UA | models | data 键 |
+ * |---|---|---|
+ * | `CLI/unknown CodeBuddy/2.136.0`（dsh-tap 同款） | 33 | 只有 agents/models/productFeatures* |
+ * | `CodeBuddyIDE/4.12.0`（官方 IDE 扩展） | 22 | 多出 `modelPromotions` / `modelTiers` / `featureToggles` … |
+ * | `WorkBuddy/5.7.2 CLI/2.156.0` | 60 | 同样的 `modelPromotions` / `modelTiers` |
+ *
+ * 所以本插件发**两次** `/v3/config`：
+ *   1. **目录请求**用 dsh-tap 同款 UA —— 必须如此，否则拿到的模型集合与
+ *      宿主里真正可选的模型对不上（`hy4-preview-x` 这类条目在不同视图里
+ *      时有时无，且只有 CLI 视图与 llm-pi-ai 的清单同源）；
+ *   2. **活动请求**用 `CodeBuddyIDE/…` UA —— 只为取 `modelPromotions` 与
+ *      `modelTiers`，**不参与**模型集合。
+ * 活动请求失败时静默降级（目录照常出徽标，促销为空），绝不因此让路由失败。
+ *
+ * `modelPromotions[]` 的形状（实测，逐字段照抄，不臆造）：
+ *   { id, kind:'discount', enabled, priority, modelIds[],
+ *     badge:{ color, label, labelEn, shortLabel, display:'activeOnly'|'always', icon },
+ *     hover:{ textZh, textEn, action:{ labelZh, type } },
+ *     discount:{ discountedCredits:'0.50x'|'0x', displayMode, factor },
+ *     schedule:{ timezone:'Asia/Shanghai', validFrom, validUntil,
+ *                daily:[{ start:'23:00', end:'7:50' }] } }
+ * 「夜间」不是独立字段——它就是 `schedule.daily` 的每日时段窗口 + `timezone`。
+ * `modelTiers` 给出「订阅优先」这类按用户等级生效的徽标。
+ * 二者都是**服务端下发**的：我们只做时段判定与择优（priority 高者胜），
+ * 标签文案一个字都不自己编。
  */
 
 
@@ -55,11 +82,17 @@ const HEALTH_ROUTE = '/dsh-model-info/health'
 const DIAG_ROUTE = '/dsh-model-info/diag'
 
 /**
- * /v3/config 门禁校验的 UA。实际只验证 `CodeBuddy/x.y` 子串；
- * `CLI/unknown` 前缀只是社区惯例，保留它是为了与 dsh-tap 的请求形态一致。
-
+ * 目录请求的 UA。/v3/config 的 UA 门是子串匹配 `/codebuddy\/[^a-z\s]*\./i`；
+ * 与 dsh-tap（providers/codebuddy/headers.js）保持同款是刻意的——
+ * 网关按 UA 分发行情，换个 UA 拿到的就不是同一个模型集合。
  */
 const USER_AGENT = 'CLI/unknown CodeBuddy/2.136.0'
+/**
+ * 活动请求的 UA（官方 IDE 扩展同款）。只有带这个产品名的响应才携带
+ * `modelPromotions` / `modelTiers`；**绝不**用它取模型集合——它会多出
+ * `hy4-preview-ctrl` / `hy3-b` / `codewise-*` 等宿主里并不存在的条目。
+ */
+const PROMO_USER_AGENT = 'CodeBuddyIDE/4.12.0'
 const DEFAULT_BASE = 'https://copilot.tencent.com'
 /** 凭据选择的记忆时长；失败即丢弃。 */
 const CRED_TTL_MS = 10 * 60 * 1000
@@ -79,6 +112,8 @@ export const Config = z.object({
   uiTrigger: z.boolean().default(true),
   /** 是否在 /model 下拉行内渲染倍率与标签。 */
   uiMenu: z.boolean().default(true),
+  /** 是否额外发一次 IDE-UA 请求去取 `modelPromotions` / `modelTiers`。 */
+  promotions: z.boolean().default(true),
   /** 是否接收客户端诊断上报（那是我们在宿主侧看不到的浏览器状态）。 */
   diagnostics: z.boolean().default(true),
   debug: z.boolean().default(false),
@@ -198,23 +233,188 @@ export function normalizeModel(raw, trial, craftSet) {
   }
 }
 
+// ── 促销 / 档位徽标（`data.modelPromotions` / `data.modelTiers`）────────
+// 全部字段由服务端下发；这里只做三件事：解析 "H:mm"、判定时段、按 priority 择优。
+
+/** "23:00" / "7:50" / "23" → 当日分钟数；解析不出返回 null。 */
+export function parseClock(text) {
+  if (typeof text !== 'string') return null
+  const m = text.trim().match(/^(\d{1,2})(?::(\d{1,2}))?$/)
+  if (!m) return null
+  const h = Number(m[1])
+  const min = m[2] === undefined ? 0 : Number(m[2])
+  if (!Number.isFinite(h) || !Number.isFinite(min)) return null
+  if (h > 24 || min > 59) return null
+  return h * 60 + min
+}
+
+/**
+ * 取某个 IANA 时区下的「当前时刻的分钟数 + 星期」。
+ * 用 Intl 而不是本地 Date：容器/机器的 TZ 未必是用户所在时区，
+ * 而 `schedule.timezone` 是服务端给的（实测恒为 Asia/Shanghai）。
+ */
+export function zonedNow(timezone, at = new Date()) {
+  const tz = typeof timezone === 'string' && timezone ? timezone : 'Asia/Shanghai'
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit', weekday: 'short',
+    }).formatToParts(at)
+    const get = (type) => parts.find((p) => p.type === type)?.value ?? ''
+    const hour = Number(get('hour')) % 24 // '24' 出现在午夜的某些实现里
+    const minute = Number(get('minute'))
+    const weekday = get('weekday')
+    return {
+      minutes: hour * 60 + (Number.isFinite(minute) ? minute : 0),
+      // 0=周日 … 6=周六 → ISO 1..7
+      isoDay: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(weekday) + 1,
+      hour,
+      minute,
+    }
+  } catch {
+    return { minutes: at.getHours() * 60 + at.getMinutes(), isoDay: at.getDay() + 1, hour: at.getHours(), minute: at.getMinutes() }
+  }
+}
+
+/**
+ * 一条 schedule 此刻是否生效。
+ * `daily` 是**每日时段窗口**数组（`[start, end)`，可跨零点如 23:00→7:50）；
+ * 缺失 = 全天。validFrom/validUntil 是绝对时间窗（ISO-8601）。
+ */
+export function scheduleActive(schedule, now = zonedNow(schedule?.timezone)) {
+  if (!schedule || typeof schedule !== 'object') return true
+  const from = schedule.validFrom ? Date.parse(schedule.validFrom) : NaN
+  const until = schedule.validUntil ? Date.parse(schedule.validUntil) : NaN
+  const at = Date.now()
+  if (Number.isFinite(from) && at < from) return false
+  if (Number.isFinite(until) && at >= until) return false
+  const windows = Array.isArray(schedule.daily) ? schedule.daily : []
+  if (!windows.length) return true
+  for (const w of windows) {
+    const start = parseClock(w?.start)
+    const end = parseClock(w?.end)
+    if (start === null || end === null) continue
+    if (start <= end) {
+      if (now.minutes >= start && now.minutes < end) return true
+    } else {
+      // 跨零点：23:00 → 次日 7:50
+      if (now.minutes >= start || now.minutes < end) return true
+    }
+  }
+  return false
+}
+
+/** 归一化一条促销/档位条目；缺 id 或 modelIds 的丢弃。 */
+export function normalizePromotion(raw, kind) {
+  if (!raw || typeof raw !== 'object') return null
+  const id = typeof raw.id === 'string' ? raw.id : null
+  const modelIds = Array.isArray(raw.modelIds)
+    ? raw.modelIds.filter((m) => typeof m === 'string' && m)
+    : []
+  if (!id || !modelIds.length) return null
+  const badge = raw.badge && typeof raw.badge === 'object' ? raw.badge : {}
+  const hover = raw.hover && typeof raw.hover === 'object' ? raw.hover : {}
+  const discount = raw.discount && typeof raw.discount === 'object' ? raw.discount : {}
+  // "0.50x" / "0x" / "0.00x" → 0.5 / 0 / 0；没有就用 factor。
+  const parsed = parseCredits(String(discount.discountedCredits ?? ''))
+  const factor = parsed
+    ? parsed.multiplier
+    : Number.isFinite(discount.factor) ? discount.factor : null
+  return {
+    id,
+    kind: typeof raw.kind === 'string' && raw.kind ? raw.kind : kind,
+    priority: Number.isFinite(raw.priority) ? raw.priority : 0,
+    enabled: raw.enabled !== false,
+    modelIds,
+    label: firstString(badge.label, badge.labelEn),
+    shortLabel: firstString(badge.shortLabel, badge.shortLabelEn, badge.label, badge.labelEn),
+    color: typeof badge.color === 'string' && /^#[0-9a-f]{3,8}$/i.test(badge.color) ? badge.color : null,
+    /** display:'activeOnly' = 只在时段内显示；缺省/'always' = 常驻。 */
+    activeOnly: badge.display === 'activeOnly',
+    hover: firstString(hover.textZh, hover.textEn),
+    actionLabel: firstString(hover.action?.labelZh, hover.action?.labelEn),
+    factor,
+    discountedCredits: typeof discount.discountedCredits === 'string' ? discount.discountedCredits : null,
+    displayMode: typeof discount.displayMode === 'string' ? discount.displayMode : null,
+    schedule: raw.schedule && typeof raw.schedule === 'object' ? raw.schedule : null,
+    /** 是否"此刻生效"（时段窗口内）。 */
+    active: scheduleActive(raw.schedule),
+  }
+}
+
+/**
+ * 从**活动视图**的载荷里抽出促销与档位表。
+ * `modelTiers` 可能是对象（单条）或数组，两种都实测见过。
+ */
+export function collectPromotions(data) {
+  const list = []
+  const promotions = Array.isArray(data?.modelPromotions) ? data.modelPromotions : []
+  for (const p of promotions) {
+    const norm = normalizePromotion(p, 'discount')
+    if (norm) list.push(norm)
+  }
+  const tiers = data?.modelTiers
+    ? (Array.isArray(data.modelTiers) ? data.modelTiers : [data.modelTiers])
+    : []
+  for (const t of tiers) {
+    const norm = normalizePromotion(t, 'tier')
+    if (norm) list.push(norm)
+  }
+  return list
+}
+
+/** 按模型 id 建索引；多个命中时 priority 高者胜（服务端自己的规则）。 */
+export function indexPromotions(list) {
+  const byModel = Object.create(null)
+  for (const p of list) {
+    if (!p.enabled) continue
+    // activeOnly 的条目只在生效时段内才占位
+    if (p.activeOnly && !p.active) continue
+    for (const id of p.modelIds) {
+      const prev = byModel[id]
+      if (!prev || p.priority > prev.priority) byModel[id] = p
+    }
+  }
+  return byModel
+}
+
 export function apply(ctx, config = {}) {
   const baseURL = (typeof config.baseURL === 'string' && config.baseURL.trim()) || DEFAULT_BASE
   const cacheMs = Number.isFinite(config.cacheMs) ? config.cacheMs : 300000
   const timeoutMs = Number.isFinite(config.requestTimeoutMs) ? config.requestTimeoutMs : 8000
   const allowRefresh = config.allowRefresh !== false
   const diagnostics = config.diagnostics !== false
+  const usePromotions = config.promotions !== false
 
   const state = {
-    cache: { at: 0, models: null },
+    cache: { at: 0, models: null, promotions: [] },
     inFlight: null,
     credKind: null,
     credAt: 0,
     lastError: null,
     lastFetchMs: null,
+    /** 上一次活动视图（promotions）抓取的结果，供 /health 观察。 */
+    promoError: null,
   }
 
   const ui = () => ({ trigger: config.uiTrigger !== false, menu: config.uiMenu !== false })
+
+  /** 一次 /v3/config；超时与凭据都在这里，调用方只管解析。 */
+  async function fetchConfig(cred, userAgent) {
+    const res = await fetch(`${baseURL}/v3/config`, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': userAgent,
+        // X-Product 按 dsh-tap 的头部说明属社区惯例；保留以保持一致。
+        'X-Product': 'SaaS',
+        ...cred.headers,
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) throw new Error(`upstream-http-${res.status}`)
+    const body = await res.json()
+    if (body?.code !== 0) throw new Error(`upstream-${body?.code}`)
+    return body
+  }
 
   async function fetchUpstream() {
     const started = Date.now()
@@ -230,25 +430,7 @@ export function apply(ctx, config = {}) {
       }
       for (const cred of creds) {
         try {
-          const res = await fetch(`${baseURL}/v3/config`, {
-            headers: {
-              Accept: 'application/json',
-              'User-Agent': USER_AGENT,
-              // X-Product 按 dsh-tap 的头部说明属社区惯例；保留以保持一致。
-              'X-Product': 'SaaS',
-              ...cred.headers,
-            },
-            signal: AbortSignal.timeout(timeoutMs),
-          })
-          if (!res.ok) {
-            state.lastError = `upstream-http-${res.status}`
-            continue
-          }
-          const body = await res.json()
-          if (body?.code !== 0) {
-            state.lastError = `upstream-${body?.code}`
-            continue
-          }
+          const body = await fetchConfig(cred, USER_AGENT)
           const agents = Array.isArray(body.data?.agents) ? body.data.agents : []
           const craftSet = new Set(
             agents
@@ -262,7 +444,9 @@ export function apply(ctx, config = {}) {
           state.credKind = cred.kind
           state.credAt = Date.now()
           state.lastError = null
-          return { models, source: cred.kind }
+          // 活动视图是**增强**，不是依赖：失败只留 promoError，目录照常返回。
+          const promotions = await fetchPromotions(cred)
+          return { models, source: cred.kind, promotions }
         } catch (error) {
           state.lastError = String(error?.message ?? error)
         }
@@ -271,6 +455,39 @@ export function apply(ctx, config = {}) {
     } finally {
       state.lastFetchMs = Date.now() - started
     }
+  }
+
+  /**
+   * 第二次请求：换 IDE 产品名的 UA，只为取 `modelPromotions` / `modelTiers`。
+   * 该视图的模型集合与宿主可选清单不同源（多出 -ctrl/-b/codewise-* 等），
+   * 所以**绝不**用它替换目录。失败一律静默降级为空数组。
+   */
+  async function fetchPromotions(cred) {
+    if (!usePromotions) return []
+    try {
+      const body = await fetchConfig(cred, PROMO_USER_AGENT)
+      const list = collectPromotions(body.data)
+      state.promoError = null
+      return list
+    } catch (error) {
+      state.promoError = String(error?.message ?? error)
+      // 保留上一次成功的活动数据（如果有），避免一次抖动抹掉徽标。
+      return Array.isArray(state.cache.promotions) ? state.cache.promotions : []
+    }
+  }
+
+  /**
+   * 缓存里的 `active` 是抓取那一刻算的，而夜间窗口的边界是 23:00 / 8:00 ——
+   * 5 分钟缓存足以跨过边界。所以**每次读取都按当前时刻重算**这一位，
+   * 其余字段（文案、倍率、时段定义）沿用缓存，一次都不多打上游。
+   */
+  function livePromotions() {
+    const list = state.cache.promotions
+    if (!Array.isArray(list) || !list.length) return []
+    return list.map((p) => {
+      const active = p.schedule ? scheduleActive(p.schedule) : p.active
+      return active === p.active ? p : { ...p, active }
+    })
   }
 
   function view(extra) {
@@ -282,8 +499,13 @@ export function apply(ctx, config = {}) {
       baseURL,
       fetchedAt: state.cache.at,
       ui: ui(),
-      health: { lastFetchMs: state.lastFetchMs, lastError: state.lastError },
+      health: {
+        lastFetchMs: state.lastFetchMs,
+        lastError: state.lastError,
+        promoError: state.promoError,
+      },
       models: state.cache.models ?? [],
+      promotions: livePromotions(),
       ...extra,
     }
   }
@@ -292,7 +514,13 @@ export function apply(ctx, config = {}) {
     if (state.inFlight) return state.inFlight
     state.inFlight = fetchUpstream()
       .then((result) => {
-        if (result) state.cache = { at: Date.now(), models: result.models }
+        if (result) {
+          state.cache = {
+            at: Date.now(),
+            models: result.models,
+            promotions: Array.isArray(result.promotions) ? result.promotions : [],
+          }
+        }
         return result
       })
       .catch((error) => {
@@ -327,8 +555,13 @@ export function apply(ctx, config = {}) {
         baseURL,
         fetchedAt: 0,
         ui: ui(),
-        health: { lastFetchMs: state.lastFetchMs, lastError: state.lastError },
+        health: {
+          lastFetchMs: state.lastFetchMs,
+          lastError: state.lastError,
+          promoError: state.promoError,
+        },
         models: [],
+        promotions: [],
         reason: state.lastError ?? 'unavailable',
       }
     }
@@ -406,6 +639,8 @@ export function apply(ctx, config = {}) {
           cacheAgeMs: state.cache.at ? Date.now() - state.cache.at : null,
           lastFetchMs: state.lastFetchMs,
           lastError: state.lastError,
+          promoError: state.promoError,
+          promotions: state.cache.promotions?.length ?? 0,
           source: state.credKind,
           baseURL,
           inFlight: state.inFlight !== null,
