@@ -414,6 +414,22 @@ ok('id 查不到时退回文本', client.lookup('Only-One', byId('nope')).rate =
 ok('同名且 id 查不到时不乱挂', client.lookup('DeepSeek-V4-Pro', byId('nope')) === null)
 ok('没有 host 时按文本解析（老形状）', client.lookup('Only-One').rate === '0.2x')
 
+console.log('client pinned row:')
+// 实测：宿主给 Auto 那一行**不写** data-model-id（诊断里是 row:miss:null|Auto），
+// 它也不在我们的目录里。置顶判断只看 id 会漏掉它，所以名字优先。
+const fakeRow = (name, id) => ({
+  tagName: 'BUTTON',
+  querySelector: (sel) => {
+    if (sel === '[class*="_modelName"]') return { textContent: name }
+    if (sel === '[data-model-id]') return id === undefined ? null : { getAttribute: () => id }
+    return null
+  },
+})
+ok('Auto 行被认作置顶（无 data-model-id）', client.isPinnedRow(fakeRow('Auto')) === true)
+ok('大小写不敏感', client.isPinnedRow(fakeRow('auto')) === true)
+ok('按 id 也认', client.isPinnedRow(fakeRow('别的名字', 'auto')) === true)
+ok('其它行不置顶', client.isPinnedRow(fakeRow('DeepSeek-V4-Pro', 'deepseek-v4-pro')) === false)
+
 console.log('client lookup fallback:')
 // 宿主会在名字后面追加自己的标记（如 "DeepSeek-V4.1-Flash 1017"），
 // 整串既不是 id 也不是目录里的名字 —— 否则这一行就完全没有额外信息。
