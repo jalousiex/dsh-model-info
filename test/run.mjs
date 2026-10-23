@@ -48,11 +48,12 @@ const hostCtx = { console, process, Buffer, setTimeout, clearTimeout }
 vm.createContext(hostCtx)
 vm.runInContext(
   hostSource +
-    '\n;globalThis.__host = { parseCredits, normalizeModel, parseClock, zonedNow, scheduleActive, normalizePromotion, collectPromotions, indexPromotions };',
+    '\n;globalThis.__host = { parseCredits, parseRateText, normalizeModel, parseClock, zonedNow, scheduleActive, normalizePromotion, collectPromotions, indexPromotions };',
   hostCtx,
 )
 const {
   parseCredits,
+  parseRateText,
   normalizeModel,
   parseClock,
   zonedNow,
@@ -73,6 +74,16 @@ check('undefined', parseCredits(undefined), null)
 check('garbage', parseCredits('garbage'), null)
 check('number input', parseCredits(0.5), null)
 check('empty string', parseCredits(''), null)
+
+console.log('parseRateText（各供应商展示写法不统一）:')
+check('Qoder 的 0.5×', parseRateText('0.5×'), 0.5)
+check('0.2x', parseRateText('0.2x'), 0.2)
+check('x0.29 credits', parseRateText('x0.29 credits'), 0.29)
+check('裸数字串', parseRateText('0.36'), 0.36)
+check('数字输入', parseRateText(0.2), 0.2)
+check('空串', parseRateText(''), null)
+check('null', parseRateText(null), null)
+check('garbage', parseRateText('garbage'), null)
 
 console.log('normalizeModel:')
 const craft = new Set(['hy4-preview'])
@@ -390,10 +401,13 @@ ok('同一活动只算一条', glm.activities.length === 1)
 ok('保留带 factor 的那条', glm.activities[0].factor === 0.5)
 ok('无促销的模型没有活动', client.lookup('no-promo').activities.length === 0)
 // 时段摘要：跨零点标「次日」，只给 timezone（无 daily）时不编造时段。
-check('跨零点窗口', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily: [{ start: '23:00', end: '7:50' }] }), '每天 23:00–07:50（次日）（时段跨零点）')
+check('跨零点窗口', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily: [{ start: '23:00', end: '7:50' }] }), '每天 23:00–07:50（次日）')
+// 上游把一条夜间规则拆成两段时，必须合并回一段（否则是「起点次日 23:00–23:59、00:00–07:50」的噪音）。
+check('跨零点两段合并成一段', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily: [{ start: '23:00', end: '23:59' }, { start: '0:00', end: '7:50' }] }), '每天 23:00–07:50（次日）')
 check('白天窗口', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily: [{ start: '7:50', end: '23:00' }] }), '每天 07:50–23:00')
 check('无 daily = 不写时段', client.scheduleSummary({ timezone: 'Asia/Shanghai' }), null)
-check('整天窗口不写「每天 00:00–23:59」', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily: [{ start: '00:00', end: '23:59' }] }), null)
+// 整天窗口不能写成冗长的「00:00–23:59」，但也要让用户看到「不限时段」。
+check('整天窗口写「全天」', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily: [{ start: '00:00', end: '23:59' }] }), '全天')
 check('带截止日', client.scheduleSummary({ timezone: 'Asia/Shanghai', daily: [{ start: '8:00', end: '23:00' }], validUntil: '2026-11-01T00:00:00+08:00' }), '每天 08:00–23:00，11月1日 结束')
 ok('纯文本 tip 列出活动', client.tooltip(glm).includes('每晚 23:00'))
 ok('纯文本 tip 带消耗速度', client.tooltip(glm).includes('0.79x'))
@@ -410,9 +424,43 @@ client.indexModels([
 const byId = (id) => ({ getAttribute: (name) => (name === 'data-model-id' ? id : null) })
 ok('按 data-model-id 取各自的倍率', client.lookup('DeepSeek-V4-Pro', byId('v4pro-account')).rate === '0.51x')
 ok('同名另一条取它自己的倍率', client.lookup('DeepSeek-V4-Pro', byId('v4pro-codebuddy')).rate === '1.25x')
-ok('id 查不到时退回文本', client.lookup('Only-One', byId('nope')).rate === '0.2x')
+// 行上有权威 id 但目录里没有它：**放弃**，绝不退回按名字解析 ——
+// 否则别的分组的同名模型会被串上本插件的详情。
+ok('id 查不到时不退回文本（防跨分组串组）', client.lookup('Only-One', byId('nope')) === null)
 ok('同名且 id 查不到时不乱挂', client.lookup('DeepSeek-V4-Pro', byId('nope')) === null)
 ok('没有 host 时按文本解析（老形状）', client.lookup('Only-One').rate === '0.2x')
+// 宿主/其它插件会把倍率与标签拼进显示名，退回文本解析时要剥掉。
+ok('剥掉拼进名字的后缀再解析', client.lookup('Only-One · x0.2 · 夜间免费')?.rate === '0.2x')
+
+console.log('client model id extraction:')
+// 宿主把 data-model-id 写在**行内的名字元素**上，行容器自身没有。
+// 只读 host.getAttribute 会永远拿不到 id，于是退回按名字解析 → 跨组串。
+const rowWithId = (id) => ({
+  getAttribute: () => null, // 行容器自身没有 data-model-id
+  querySelector: (sel) => (sel === '[data-model-id]' ? { getAttribute: () => id } : null),
+})
+ok('从行容器内部取到 data-model-id', client.modelIdOf(rowWithId('uniq')) === 'uniq')
+ok('行内取到 id 时按 id 解析', client.lookup('Only-One', rowWithId('uniq'))?.rate === '0.2x')
+ok('行容器无 id 子元素时返回 null', client.modelIdOf({ getAttribute: () => null, querySelector: () => null }) === null)
+
+console.log('client cross-provider scoping:')
+// 同一个 model id 在两个供应商下并存（内置 DeepSeek 与 Trae 都有
+// deepseek-v4-pro）。宿主给行写的 data-model-id 相同，只有**分组标题**
+// 能区分它们 —— 否则一个分组的上下文/思考档会被贴到另一个分组的行上。
+client.indexModels([
+  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', provider: 'deepseek', rate: 0.51 },
+  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', provider: 'trae', rate: 1.25, contextWindow: 1000000 },
+])
+// 造一个能回答 closest([role="group"]) 的行，组标题为 "Trae"。
+const inGroup = (groupId, groupLabel) => ({
+  getAttribute: (name) => (name === 'data-model-id' ? groupId : null),
+  closest: (sel) => (sel === '[role="group"]'
+    ? { getAttribute: () => null, children: [{ textContent: groupLabel }] }
+    : null),
+})
+ok('分组 Trae 取 Trae 的倍率', client.lookup('DeepSeek-V4-Pro', inGroup('deepseek-v4-pro', 'Trae'))?.rate === '1.25x')
+// 分组认不出时退回全局 id（后注册者胜），不抛错。
+ok('分组认不出时仍能解析', client.lookup('DeepSeek-V4-Pro', byId('deepseek-v4-pro')) !== null)
 
 console.log('client pinned row:')
 // 实测：宿主给 Auto 那一行**不写** data-model-id（诊断里是 row:miss:null|Auto），
@@ -448,6 +496,56 @@ console.log('client hot zone:')
 // 摘掉宿主原生 title 之后，热区是唯一的悬浮入口，这就是它消失的原因。
 ok('没有徽标也建热区', /if \(!nodes\.length\)[\s\S]{0,400}?hot\.setAttribute\(ANCHOR, ""\)/.test(clientSource))
 ok('没有徽标时清掉的只是徽标，不是热区', !/if \(!nodes\.length\)[\s\S]{0,300}?clearHot\(hot\)/.test(clientSource))
+// onOver 拿到的是 [ANCHOR] 元素（= 热区 = 名字元素），不是行容器。
+// 只把 rec 存在行容器上，showTipFor(anchor) 就永远查不到 —— 悬浮卡彻底不弹。
+ok('按热区元素也能取到 rec（悬浮卡入口）', /decorated\.set\(hot,\s*\{/.test(clientSource))
+// 摘原生 title 必须在**确认能找到热区元素之后**：否则一行既没有原生提示、
+// 也没有自绘卡，表现为「有些模型只有原生 tip / 什么都不弹」。
+const applyToBody = clientSource.slice(
+  clientSource.indexOf('function applyTo('),
+  clientSource.indexOf('function decorateTrigger('),
+)
+ok('找不到热区元素时不摘原生 title', (() => {
+  const anchorAt = applyToBody.indexOf('nameElementOf(target)')
+  const titleAt = applyToBody.indexOf('removeAttribute("title")')
+  return anchorAt >= 0 && titleAt >= 0 && anchorAt < titleAt
+})())
+// 行里没有 `_modelName` 时（不同 provider 的行结构可能不同）要能退回
+// `[data-model-id]`，否则那一行既不摘 title 也不建热区。
+ok('名字元素找不到时退回 data-model-id', /function nameElementOf\(option\)[\s\S]{0,400}querySelector\("\[data-model-id\]"\)/.test(clientSource))
+ok('点击/按下时收起悬浮卡（不挡切换入口）', /addEventListener\("mousedown", onPress, true\)/.test(clientSource))
+ok('悬停时兜底补挂热区（宿主重渲染后仍能弹）', /function recoverHot\(target\)/.test(clientSource))
+// 卡默认出现在锚点**右侧**，不能落在鼠标正下方盖住下一行。
+ok('悬浮卡放锚点右侧（不在鼠标正下方）', /r\.right \+ gap \+ w <= vw - pad/.test(clientSource))
+ok('右侧放不下时退到左侧', /r\.left - gap - w >= pad/.test(clientSource))
+// 两侧都放不下时也不能压在锚点行上（否则看着像「卡在鼠标下面」）。
+ok('与锚点横向重叠时改上下错开', /overlapsHorizontally/.test(clientSource) && /r\.bottom \+ gap/.test(clientSource))
+// 促销原文紧跟描述（官方排法），不在卡片底部重复一次。
+ok('促销原文紧跟描述', /actNote\.textContent = noteParts\.join/.test(clientSource))
+ok('活动价不在底部重复原文', !/tip\.appendChild\(promoBox\(/.test(clientSource))
+// Trae 的闲时折扣只有 factor + 时段、没有原文 —— 不能因为没有原文整条丢掉。
+ok('无原文但有折扣/时段的活动也渲染', /typeof act\.factor === "number"\) noteParts\.push/.test(clientSource))
+// 带 days 的窗口必须按星期分组处理，否则会被拼成假跨零点。
+ok('窗口按星期分组', /byDays\[key\]/.test(clientSource))
+// 只有「恰好两段且晚→晨」才推断为上游拆分的跨零点规则。
+ok('只在两段时合并跨零点', /local\.length === 2/.test(clientSource))
+// 观感对齐 WorkBuddy：固定宽度卡片 + 标题行内联促销徽标 + 分隔线。
+ok('卡片固定宽度（对齐 WorkBuddy 观感）', /\.dmi-tip\{[^}]*width:330px/.test(clientSource))
+ok('标题行内联促销徽标', /title\.appendChild\(headChip\)/.test(clientSource))
+ok('字段区有分隔线', /\.dmi-tip-grid\{[^}]*border-top:1px solid/.test(clientSource))
+// 配色对齐：卡片走主题令牌（深色自动跟随）、可展开项用品牌色、上游动作文案用链接色。
+// 卡片底色取 bg-layer-1：深色主题下 bg-layer-2 偏亮，卡片会「浮起来」显脏。
+ok('卡片底色更深一档（bg-layer-1）', /\.dmi-tip\{[^}]*background:var\(--dsw-alias-bg-layer-1/.test(clientSource))
+ok('卡片边框用 l2 档', /\.dmi-tip\{[^}]*border:1px solid var\(--dsw-alias-border-l2/.test(clientSource))
+// 促销徽标必须是「同色相药丸」：半透明底 + 细描边，不能是整块实色。
+ok('徽标用 color-mix 派生半透明底', /color-mix\(in srgb, " \+ color \+ " 22%/.test(clientSource))
+ok('徽标有同色描边', /border = "1px solid color-mix\(in srgb, " \+ color/.test(clientSource))
+ok('不用整块实色背景', !/style\.backgroundColor = (p|act|promo|headPromo)\.color/.test(clientSource))
+ok('可展开字段用品牌色', /\.dmi-tip-v\.dmi-tip-expandable\{[^}]*alias-brand-primary/.test(clientSource))
+ok('上游动作文案用链接色', /\.dmi-tip-link\{[^}]*alias-brand-primary/.test(clientSource))
+ok('可展开项带箭头', /dmi-tip-arrow/.test(clientSource))
+// 只使用 Theme 目录里真实存在的令牌（否则会静默退回兜底色）。
+ok('不使用不存在的主题令牌', !/--dsw-alias-state-business-primary/.test(clientSource))
 
 console.log('client static discipline:')
 ok('自绘悬浮卡（不用原生 title 排版）', /\.dmi-tip\{/.test(clientSource) && !/rec\.tip\s*=\s*tooltip/.test(clientSource))

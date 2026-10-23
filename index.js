@@ -1,78 +1,42 @@
-﻿/**
+/**
  * dsh-model-info —— 宿主半（host half）。
  *
- * 职责：暴露 CodeBuddy 网关**发布了但 dsh-tap 丢掉**的每模型元信息：
- * `credits` 倍率（如 "0.29x"）、由它推导出的「是否计费」标志，
- * 以及描述 / 上下文窗口 / 思考档 / 标签 / 试用横幅 / `craft` 推荐集合。
+ * 职责：聚合各供应商（WorkBuddy / Trae / Qoder）的每模型元信息，统一暴露给
+ * 浏览器半的悬浮卡与行内徽标。数据源**全部复用** `dsh-workbuddy-trae-qoder-connect`
+ * 已经落地的文件 / 路由，不自己打上游、不持有凭据：
  *
- * 展示的所有字段都来自**同一个实时响应**：
- * `descriptionZh`、`maxAllowedSize`（上下文）、`reasoning.supportedEfforts`、
- * `tags`、`productFeaturesConfig.ModelTrialBanner`、`agents[].modelTags`。
+ *   · WorkBuddy（CN）：`~/.dsh/.workbuddy{n}-catalog.json`
+ *       entries[<account>].models[] —— 含 id/name/contextWindow/maxTokens/
+ *       supportsImages/reasoning/billing{credits,badges,free}
+ *   · Trae CN：`~/.dsh/trae-cn/models.json`
+ *       models[] —— 含 id/name/contextWindow/maxTokens/supportsImages/
+ *       reasoningByGroup/contextWindowByGroup/rate(number)/rateActivity(number)
+ *   · Qoder CN：`GET /plugins/dsh-qoder-connect/status`（loopback）
+ *       models[] —— 含 id/name/rate/free/contextWindow/isReasoning
+ *       （Qoder 目录不落地，只能走状态路由；详细字段以它给的为准）
  *
- * 本机官方 VS Code 扩展的 `product.json` 曾作为补充被合并，**现在完全不读**。
- * 实测依据：那份文件是一份冻结目录，15 个 id 里只有 4 个仍在上游列表中、
- * 只有 3 个带描述；而 /v3/config 在 33 个模型上带了 11 条描述。
- * 上游既更新又更全，故作为唯一来源 —— 这里的内容不会因客户端版本而陈旧。
+ * 归一化后的统一 shape（浏览器半只认这一份）：
+ *   { id, name, provider, rate(number), free(bool), credits(string|null),
+ *     badges(string[]), contextWindow(number|undefined),
+ *     maxTokens(number|undefined), supportsImages(bool), efforts(string[]),
+ *     promotions: [] }
  *
- * 为什么必须有宿主半：倍率位于
- *   GET {baseURL}/v3/config
- * 该接口需要凭据（OAuth bearer 或 api key）以及能过网关 12403 校验的 UA。
- * 浏览器半无法直接调用 —— 凭据绝不离开本进程，而从 harness 页面发起跨域请求
- * 还需要网关并不发送的 CORS 头。所以由宿主半抓取、缓存，并以 loopback 路由服务客户端。
+ * `credits` 是供应商自己的**展示**倍率，**不是线性价格**（实测 credit/1k tokens
+ * 不随它线性变化）；唯一硬映射是 x0.00 <=> 不计费。所以同时给原始字符串、
+ * 数字和 free 布尔值，绝不宣称「贵 N 倍」。
  *
- * 凭据探测是**刻意多源**的（不硬依赖任何单一插件的存储）：
- *   1. ~/.dsh/codebuddy-plugin-auth.json   {auth:{accessToken}}    （OAuth）
- *   2. ~/.dsh/codebuddy-plugin.json        {apiKeys,activeApiKey}  （api key）
- *   3. ~/.dsh/codebuddy-auth.json          {auth:{accessToken}}    （旧格式）
- * 第一个以 code===0 应答 /v3/config 的候选获胜并被记住；被拒的候选跳过。
- * 任何凭据都不经路由暴露 —— 只输出推导后的每模型数字。
+ * 促销标签（`夜间免费` / `限时免费` 等）在 CN 版 WorkBuddy 里只以 `billing.badges`
+ * 形式存在，没有时段/折扣明细；Trae 的活动信息在 `rateActivity` 里，也不足以
+ * 构建时段。所以 `promotions` 统一为空数组，行内徽标直接用 `badges`。
  *
- * 硬规则（踩坑换来的）：
- *   · 每次上游请求都带 AbortSignal.timeout；网关挂住绝不让路由挂起
- *     （GUI 的 RPC 同源，且 HTTP/1.1 只有 6 条连接）。
- *   · 过期缓存立即返回、后台刷新；客户端绝不等一个冷启动的网关。
- *
- * 诚实约束（详见 README）：`credits` 是网关自己的**展示**倍率，
- * **不是线性价格** —— 实测 credit/1k tokens 并不随它线性变化。
- * 上游唯一被验证过的硬映射是 x0.00 <=> 不计费。
- * 因此我们同时给出原始字符串、解析后的数字和 `free` 布尔值，
- * 但绝不宣称「贵 N 倍」。
- *
- * ## 促销标签（`限时免费` / `夜间免费` / `夜间折扣` / `独家限免` / `订阅优先`）
- *
- * 早期结论是"网关不发布它们"，**该结论已被推翻**：`/v3/config` 的载荷**按
- * `User-Agent` 里的产品名分发行情**——同一个 token、同一个 URL，UA 不同，
- * `data` 的键集合与模型条数都不同（2026-10-17 实测）：
- *
- * | UA | models | data 键 |
- * |---|---|---|
- * | `CLI/unknown CodeBuddy/2.136.0`（dsh-tap 同款） | 33 | 只有 agents/models/productFeatures* |
- * | `CodeBuddyIDE/4.12.0`（官方 IDE 扩展） | 22 | 多出 `modelPromotions` / `modelTiers` / `featureToggles` … |
- * | `WorkBuddy/5.7.2 CLI/2.156.0` | 60 | 同样的 `modelPromotions` / `modelTiers` |
- *
- * 所以本插件发**两次** `/v3/config`：
- *   1. **目录请求**用 dsh-tap 同款 UA —— 必须如此，否则拿到的模型集合与
- *      宿主里真正可选的模型对不上（`hy4-preview-x` 这类条目在不同视图里
- *      时有时无，且只有 CLI 视图与 llm-pi-ai 的清单同源）；
- *   2. **活动请求**用 `CodeBuddyIDE/…` UA —— 只为取 `modelPromotions` 与
- *      `modelTiers`，**不参与**模型集合。
- * 活动请求失败时静默降级（目录照常出徽标，促销为空），绝不因此让路由失败。
- *
- * `modelPromotions[]` 的形状（实测，逐字段照抄，不臆造）：
- *   { id, kind:'discount', enabled, priority, modelIds[],
- *     badge:{ color, label, labelEn, shortLabel, display:'activeOnly'|'always', icon },
- *     hover:{ textZh, textEn, action:{ labelZh, type } },
- *     discount:{ discountedCredits:'0.50x'|'0x', displayMode, factor },
- *     schedule:{ timezone:'Asia/Shanghai', validFrom, validUntil,
- *                daily:[{ start:'23:00', end:'7:50' }] } }
- * 「夜间」不是独立字段——它就是 `schedule.daily` 的每日时段窗口 + `timezone`。
- * `modelTiers` 给出「订阅优先」这类按用户等级生效的徽标。
- * 二者都是**服务端下发**的：我们只做时段判定与择优（priority 高者胜），
- * 标签文案一个字都不自己编。
+ * 硬规则：
+ *   · 读磁盘文件用 readFile（不缓存句柄）；打 loopback 路由带 AbortSignal.timeout。
+ *   · 过期缓存立即返回、后台刷新；客户端绝不等一个慢的上游。
+ *   · 单个供应商失败不影响其他供应商；该供应商的模型从上一轮缓存里继续用。
  */
 
 
-import { readFile, mkdir, writeFile } from 'node:fs/promises'
+import { readFile, mkdir, writeFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
@@ -82,38 +46,69 @@ const HEALTH_ROUTE = '/dsh-model-info/health'
 const DIAG_ROUTE = '/dsh-model-info/diag'
 
 /**
- * 目录请求的 UA。/v3/config 的 UA 门是子串匹配 `/codebuddy\/[^a-z\s]*\./i`；
- * 与 dsh-tap（providers/codebuddy/headers.js）保持同款是刻意的——
- * 网关按 UA 分发行情，换个 UA 拿到的就不是同一个模型集合。
+ * loopback 基址。**以 webServer.getOrigin() 为准**——桌面宿主的端口是启动参数
+ * （动态的），环境变量未必带；请求进来的 Host 才是同源事实。
+ * 拿不到才退回 DSH_PORT / DSH_WEB_URL / 3079。
  */
-const USER_AGENT = 'CLI/unknown CodeBuddy/2.136.0'
-/**
- * 活动请求的 UA（官方 IDE 扩展同款）。只有带这个产品名的响应才携带
- * `modelPromotions` / `modelTiers`；**绝不**用它取模型集合——它会多出
- * `hy4-preview-ctrl` / `hy3-b` / `codewise-*` 等宿主里并不存在的条目。
- */
-const PROMO_USER_AGENT = 'CodeBuddyIDE/4.12.0'
-const DEFAULT_BASE = 'https://copilot.tencent.com'
-/** 凭据选择的记忆时长；失败即丢弃。 */
-const CRED_TTL_MS = 10 * 60 * 1000
+function loopbackBase(ws) {
+  try {
+    const origin = ws?.getOrigin?.()
+    if (typeof origin === 'string' && /^https?:\/\//.test(origin)) return origin.replace(/\/+$/, '')
+  } catch { /* 未监听时 getOrigin 会抛，走回退 */ }
+  const fromEnv = String(process.env.DSH_PORT ?? '').trim()
+  if (fromEnv) return `http://127.0.0.1:${fromEnv}`
+  try {
+    const u = new URL(String(process.env.DSH_WEB_URL ?? '').trim())
+    if (u.protocol === 'http:' && u.port) return `http://127.0.0.1:${u.port}`
+  } catch { /* 忽略 */ }
+  return 'http://127.0.0.1:3079'
+}
 /** 客户端诊断环形缓冲：文件要小（且 .cache 已被排除同步）。 */
 const DIAG_MAX = 60
 const DIAG_MAX_BYTES = 64 * 1024
 
+// ── WorkBuddy / CodeBuddy 上游 ────────────────────────────────────────────
+// 网关按 `User-Agent` 里的产品名**分发行情**：同一个 token、同一个 URL，
+// UA 不同拿到的模型集合与附加字段都不同（实测 2026-10-19）：
+//
+//   | UA                                  | models | modelPromotions |
+//   |-------------------------------------|--------|-----------------|
+//   | `CLI/2.63.2 CodeBuddy/2.63.2`       |  34    |  0              |
+//   | `WorkBuddy/5.7.2 CLI/2.156.0`       |  61    |  8              |
+//
+// 所以本插件发**两次**请求：
+//   1. 目录请求用 CLI UA —— 与 connect 注册给宿主的模型集合同源；
+//   2. 富信息请求用 App UA —— 只为取 description / promotions / tiers，
+//      **不参与**模型集合（它会多出 hy4-preview-ctrl / codewise-* 等死条目）。
+const WB_CHAT_BASE = 'https://copilot.tencent.com'
+const WB_BILLING_BASE = 'https://www.codebuddy.cn'
+/** 目录请求：connect 同款（CLI 形态），保证模型集合一致。 */
+const WB_CATALOG_UA = 'CLI/2.63.2 CodeBuddy/2.63.2'
+/** 富信息请求：桌面 App 形态，只有它带 modelPromotions / modelTiers。 */
+const WB_RICH_UA = 'WorkBuddy/5.7.2 CLI/2.156.0'
+
 export const Config = z.object({
-  baseURL: z.string().default(DEFAULT_BASE),
-  /** 单次上游 /v3/config 读取的缓存存活时长，毫秒。 */
+  /** 单次数据源读取的缓存存活时长，毫秒。 */
   cacheMs: z.number().step(1000).min(0).default(300000),
-  /** 单次上游请求的硬性超时（绝不能省）。 */
+  /** 单次 loopback / 上游请求的硬性超时（绝不能省）。 */
   requestTimeoutMs: z.number().step(500).min(1000).default(8000),
-  /** 允许调用方用 ?refresh=1 强制重新抓取上游。 */
+  /** 允许调用方用 ?refresh=1 强制重新读取。 */
   allowRefresh: z.boolean().default(true),
-  /** 是否在输入框旁的模型名后渲染徽标。 */
+  /** 是否在输入框旁的模型名后挂悬浮热区。 */
   uiTrigger: z.boolean().default(true),
-  /** 是否在 /model 下拉行内渲染倍率与标签。 */
+  /** 是否在 /model 下拉行内挂悬浮热区。 */
   uiMenu: z.boolean().default(true),
-  /** 是否额外发一次 IDE-UA 请求去取 `modelPromotions` / `modelTiers`。 */
-  promotions: z.boolean().default(true),
+  /**
+   * 是否渲染行内 / 触发器旁徽标。**默认关**：dsh-connect 已把倍率与促销标签
+   * 拼进 `model.name`（`Hy4 preview · x0.29 · 夜间免费`），再挂徽标就是重复。
+   * 本插件的主职是悬浮卡里的额外信息。
+   */
+  badges: z.boolean().default(false),
+  /**
+   * 是否自己向上游要富信息（description / modelPromotions / modelTiers）。
+   * 关掉后只有 connect 已落地的字段（上下文、思考档、倍率标签文案）。
+   */
+  rich: z.boolean().default(true),
   /** 是否接收客户端诊断上报（那是我们在宿主侧看不到的浏览器状态）。 */
   diagnostics: z.boolean().default(true),
   debug: z.boolean().default(false),
@@ -137,6 +132,39 @@ async function readJson(path) {
   }
 }
 
+/** 列出 ~/.dsh 下所有 .workbuddy{n}-catalog.json 文件。 */
+async function globWorkBuddyCatalogs(home) {
+  try {
+    const names = await readdir(home)
+    return names
+      .filter((n) => /^\.workbuddy\d+-catalog\.json$/.test(n))
+      .map((n) => join(home, n))
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 读某个 WorkBuddy 账号的凭据（connect 写在 `~/.dsh/.workbuddy{n}-auth.json`）。
+ * **只读**，凭据不出本进程、不经路由。
+ */
+async function readWorkBuddyAuth(home, n) {
+  const data = await readJson(join(home, `.workbuddy${n}-auth.json`))
+  const cred = data?.credential
+  const token = firstString(cred?.accessToken)
+  if (!token) return null
+  const domain = firstString(cred?.domain) || WB_BILLING_BASE
+  const uid = firstString(cred?.uid)
+  return {
+    token,
+    domain,
+    uid,
+    /** global 走 www.workbuddy.ai；CN 走 copilot.tencent.com。 */
+    global: /workbuddy\.ai$/i.test(domain),
+  }
+}
+
 /**
  * 解析上游的 `credits` 展示字符串。
  * "x0.51 credits" -> { multiplier: 0.51, free: false, raw: "x0.51 credits" }
@@ -154,31 +182,24 @@ export function parseCredits(raw) {
   return { multiplier, free: multiplier === 0, raw }
 }
 
-/** 按顺序从已知的 CodeBuddy 存储处收集候选凭据。 */
-export async function detectCredentials(home = dshHome()) {
-  const out = []
-  const oauth = await readJson(join(home, 'codebuddy-plugin-auth.json'))
-  const token = oauth?.auth?.accessToken
-  if (typeof token === 'string' && token.length > 0) {
-    out.push({ kind: 'oauth', headers: { Authorization: `Bearer ${token}` } })
-  }
-
-  const cfg = await readJson(join(home, 'codebuddy-plugin.json'))
-  if (cfg) {
-    const keys = Array.isArray(cfg.apiKeys) ? cfg.apiKeys : []
-    const active = keys.find((k) => k && k.name === cfg.activeApiKey)
-    const key = active?.key || keys[0]?.key || (cfg.apiKeyEnv ? process.env[cfg.apiKeyEnv] : '')
-    if (typeof key === 'string' && key.length > 0) {
-      out.push({ kind: 'api-key', headers: { Authorization: `Bearer ${key}`, 'x-api-key': key } })
-    }
-  }
-
-  const legacy = await readJson(join(home, 'codebuddy-auth.json'))
-  const legacyToken = legacy?.auth?.accessToken
-  if (typeof legacyToken === 'string' && legacyToken.length > 0) {
-    out.push({ kind: 'oauth-legacy', headers: { Authorization: `Bearer ${legacyToken}` } })
-  }
-  return out
+/**
+ * 更宽松的倍率解析：除了 `x0.51 credits`，还认 Qoder 那种 `0.5×` / `0.2x` /
+ * 纯数字串。各供应商的展示写法不统一，用同一入口收口。
+ * 认不出返回 null（宁可不显示，也不给错数字）。
+ */
+export function parseRateText(raw) {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null
+  if (typeof raw !== 'string') return null
+  const text = raw.trim()
+  if (!text) return null
+  // 先按带 x 的写法（含 "credits" 后缀）解析。
+  const withX = parseCredits(text)
+  if (withX) return withX.multiplier
+  // 再认 `0.5×` / `0.5x` / `0.5` 这类裸数字。
+  const m = text.match(/(-?\d+(?:\.\d+)?)/)
+  if (!m) return null
+  const value = Number(m[1])
+  return Number.isFinite(value) ? value : null
 }
 
 /** 取候选中第一个可用字符串并 trim；都不可用则 undefined。 */
@@ -378,108 +399,459 @@ export function indexPromotions(list) {
 }
 
 export function apply(ctx, config = {}) {
-  const baseURL = (typeof config.baseURL === 'string' && config.baseURL.trim()) || DEFAULT_BASE
   const cacheMs = Number.isFinite(config.cacheMs) ? config.cacheMs : 300000
   const timeoutMs = Number.isFinite(config.requestTimeoutMs) ? config.requestTimeoutMs : 8000
   const allowRefresh = config.allowRefresh !== false
   const diagnostics = config.diagnostics !== false
-  const usePromotions = config.promotions !== false
+  /** 是否自己向上游要 description / promotions / tiers。 */
+  const useRich = config.rich !== false
 
   const state = {
     cache: { at: 0, models: null, promotions: [] },
     inFlight: null,
-    credKind: null,
-    credAt: 0,
     lastError: null,
     lastFetchMs: null,
-    /** 上一次活动视图（promotions）抓取的结果，供 /health 观察。 */
-    promoError: null,
+    /** 各供应商的读取状态，供 /health 观察。 */
+    sources: {},
   }
 
-  const ui = () => ({ trigger: config.uiTrigger !== false, menu: config.uiMenu !== false })
+  /** webServer 实例（ctx.inject 里赋值）；loopback 请求要用它的真实 origin。 */
+  let web = null
 
-  /** 一次 /v3/config；超时与凭据都在这里，调用方只管解析。 */
-  async function fetchConfig(cred, userAgent) {
-    const res = await fetch(`${baseURL}/v3/config`, {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': userAgent,
-        // X-Product 按 dsh-tap 的头部说明属社区惯例；保留以保持一致。
-        'X-Product': 'SaaS',
-        ...cred.headers,
-      },
-      signal: AbortSignal.timeout(timeoutMs),
+  const ui = () => ({
+    trigger: config.uiTrigger !== false,
+    menu: config.uiMenu !== false,
+    badges: config.badges === true,
+  })
+
+  // ── 归一化：把各供应商的原始模型记录拍成统一 shape ──────────────────────
+
+  /**
+   * WorkBuddy catalog 模型 → 统一 shape。
+   *
+   * `rich` 是**同一个 id 在富信息视图里的那一行**（App UA 请求的结果），
+   * 有就补描述 / 思考档 / 上下文上限；没有就只用 catalog 自带的字段。
+   * `promotions` 由调用方按 id 挂（见 attachPromotions）。
+   */
+  function normWorkBuddy(raw, provider, rich) {
+    const parsed = parseCredits(raw?.billing?.credits)
+    // 思考档：catalog 的 reasoning 优先，富信息补全（某些行 catalog 只有 defaultEffort）。
+    const efforts = readEfforts(raw?.reasoning) || readEfforts(rich?.reasoning) || []
+    // 上下文窗口的**默认档**：上游 `contextWindow.defaultLength` 才是
+    // 官方客户端显示的那个数（hy4-preview = 300000）。`maxAllowedSize` 是
+    // 可选上限（1M），拿它当默认值会让卡片显示 960K/1M，比官方大一档。
+    const ctx = typeof raw?.contextWindow === 'number' && raw.contextWindow > 0
+      ? raw.contextWindow
+      : typeof rich?.contextWindow?.defaultLength === 'number' && rich.contextWindow.defaultLength > 0
+        ? rich.contextWindow.defaultLength
+        : typeof rich?.maxInputTokens === 'number' && rich.maxInputTokens > 0
+          ? rich.maxInputTokens
+          : undefined
+    // 同一模型的其它可选窗口档（官方「更大上下文」下拉的那几档）。
+    const ctxChoices = Array.isArray(rich?.contextWindow?.supportedLengths)
+      ? rich.contextWindow.supportedLengths.filter((n) => typeof n === 'number' && n > 0)
+      : []
+    const maxTokens = typeof raw?.maxTokens === 'number' && raw.maxTokens > 0
+      ? raw.maxTokens
+      : typeof rich?.maxOutputTokens === 'number' && rich.maxOutputTokens > 0
+        ? rich.maxOutputTokens
+        : undefined
+    return {
+      id: raw?.id,
+      /** 全局唯一键：`<provider>::<modelId>`。 */
+      key: `${provider}::${raw?.id}`,
+      name: firstString(raw?.name, raw?.id),
+      provider,
+      credits: parsed ? parsed.raw.replace(/\s*credits\s*$/i, '') : null,
+      rate: parsed ? parsed.multiplier : null,
+      free: parsed ? parsed.free : raw?.billing?.free === true,
+      badges: Array.isArray(raw?.billing?.badges) ? raw.billing.badges.filter((b) => typeof b === 'string') : [],
+      contextWindow: ctx,
+      /** 可选的更大窗口档（大于当前值时悬浮卡单列一行）。 */
+      maxContextWindow: ctxChoices.length && ctx && Math.max(...ctxChoices) > ctx ? Math.max(...ctxChoices) : undefined,
+      maxTokens,
+      supportsImages: raw?.supportsImages === true,
+      /** 上游显式声明的工具调用能力（只有富信息视图带）。 */
+      supportsToolCall: rich?.supportsToolCall === true,
+      efforts,
+      // 描述只在上游给的时候才有（CN 版多数行有 descriptionZh）。
+      description: firstString(rich?.descriptionZh, rich?.descriptionEn),
+      promotions: [],
+    }
+  }
+
+  /**
+   * Trae catalog 模型 → 统一 shape。
+   * `rate` 通常是数字（0.2），也容忍展示字符串（`0.2×`）。
+   * `reasoningByGroup` 是 { group: { support_thinking, options[] } }。
+   * `contextWindowByGroup` 是 { group: { dev, max } } —— `max` 就是 Trae 界面里
+   * 「更大上下文（Max）」那一档，所以两者都带上，悬浮卡可以并列显示。
+   */
+  function normTrae(raw, provider) {
+    const rate = parseRateText(raw?.rate)
+    const efforts = []
+    const byGroup = raw?.reasoningByGroup
+    if (byGroup && typeof byGroup === 'object') {
+      for (const g of Object.values(byGroup)) {
+        if (g?.support_thinking === true && Array.isArray(g.options)) {
+          for (const e of g.options) if (typeof e === 'string' && !efforts.includes(e)) efforts.push(e)
+        }
+      }
+    }
+    // 各 function 的 dev / max 窗口取并集后再取极值。
+    let maxWindow
+    const cbg = raw?.contextWindowByGroup
+    if (cbg && typeof cbg === 'object') {
+      for (const g of Object.values(cbg)) {
+        if (typeof g?.max === 'number' && g.max > 0 && (maxWindow === undefined || g.max > maxWindow)) maxWindow = g.max
+      }
+    }
+    // 兜底：`raw.features.context_windows.data` 也声明了 dev/max 两档
+    // （Trae 界面「更大上下文（Max）」开关对应的就是这里的 max_context）。
+    const cw = raw?.raw?.features?.context_windows?.data
+    if (cw && typeof cw === 'object') {
+      if (typeof cw.max_context === 'number' && cw.max_context > 0 && (maxWindow === undefined || cw.max_context > maxWindow)) {
+        maxWindow = cw.max_context
+      }
+      if (Array.isArray(cw.max_context_list)) {
+        for (const v of cw.max_context_list) {
+          if (typeof v === 'number' && v > 0 && (maxWindow === undefined || v > maxWindow)) maxWindow = v
+        }
+      }
+    }
+    // 图像理解：顶层 supportsImages 与 features.multimodal 都可能声明，
+    // 任一为真即为真（Trae 的「图片理解」勾选就是这个）。
+    const supportsImages = raw?.supportsImages === true || raw?.raw?.features?.multimodal?.enable === true
+    return {
+      id: raw?.id,
+      /** 全局唯一键：`<provider>::<modelId>`。同名模型跨供应商必须能区分。 */
+      key: `${provider}::${raw?.id}`,
+      name: firstString(raw?.name, raw?.id),
+      provider,
+      credits: rate !== null ? `x${rate}` : null,
+      rate,
+      free: rate === 0,
+      badges: [],
+      contextWindow: typeof raw?.contextWindow === 'number' && raw.contextWindow > 0 ? raw.contextWindow : undefined,
+      // «更大上下文（Max）」那一档：大于默认窗口时才单列。
+      maxContextWindow: typeof maxWindow === 'number' && maxWindow > (typeof raw?.contextWindow === 'number' ? raw.contextWindow : 0) ? maxWindow : undefined,
+      maxTokens: typeof raw?.maxTokens === 'number' && raw.maxTokens > 0 ? raw.maxTokens : undefined,
+      supportsImages,
+      efforts,
+      description: undefined,
+      promotions: traeDiscountOf(raw, provider),
+    }
+  }
+
+  /**
+   * 宽松解析 Trae 的 `weekdays`：实测是**空格分隔的字符串**（`"1 2 3 4 5"`），
+   * 也见过数组形态。两种都认，否则时段会整段丢掉。
+   */
+  function parseWeekdays(value) {
+    let parts = []
+    if (Array.isArray(value)) parts = value
+    else if (typeof value === 'string') parts = value.split(/[\s,]+/)
+    else if (typeof value === 'number') parts = [value]
+    const out = []
+    for (const p of parts) {
+      const n = Number(String(p).trim())
+      if (Number.isInteger(n) && n >= 1 && n <= 7 && !out.includes(n)) out.push(n)
+    }
+    out.sort((a, b) => a - b)
+    return out
+  }
+
+  /**
+   * Trae 的活动折扣 → 统一促销条目。
+   *
+   * Trae 把折扣放在 `raw.features.activity_discount.data`：
+   *   current  : { discount_type, before_consumption_rate, consumption_rate, discount }
+   *   off_peak : { ..., time_windows: [{ weekdays, start_minute, end_minute }], time_zone }
+   *   member   : { before_consumption_rate, after_consumption_rate, discount }
+   *
+   * 与 WorkBuddy 的两处形状差异：
+   *   · 时段是**分钟数 + 星期集合**，不是 "HH:mm" 字符串；
+   *   · `weekdays` 实测是空格分隔字符串（`"1 2 3 4 5"`），也容忍数组。
+   *
+   * `member` 是「会员专享 5 折」那一档：它没有时段（会员恒享），
+   * 但折扣率是上游明确给出的，所以单独生成一条不带 schedule 的活动。
+   */
+  function traeDiscountOf(raw, provider) {
+    const d = raw?.raw?.features?.activity_discount
+    const cur = d?.data?.current
+    if (!cur || d?.enable !== true) return []
+    const type = typeof cur.discount_type === 'string' ? cur.discount_type : ''
+    // `none` = 当前没有折扣；`subsidy` / `off_peak` 才是真折扣。
+    if (!type || type === 'none') return []
+    const out = []
+
+    const before = Number.isFinite(cur.before_consumption_rate) ? cur.before_consumption_rate : null
+    const after = Number.isFinite(cur.consumption_rate) ? cur.consumption_rate : null
+    if (after === null) return []
+    const factor = before && before > 0 ? after / before : null
+    const windows = Array.isArray(d?.data?.off_peak?.time_windows) ? d.data.off_peak.time_windows : []
+    const tz = typeof d?.data?.off_peak?.time_zone === 'string' && d.data.off_peak.time_zone
+      ? d.data.off_peak.time_zone
+      : 'Asia/Shanghai'
+    const daily = []
+    for (const w of windows) {
+      const start = Number.isFinite(w?.start_minute) ? w.start_minute : null
+      const end = Number.isFinite(w?.end_minute) ? w.end_minute : null
+      if (start === null || end === null) continue
+      const fmt = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
+      // end_minute = 1440 表示到当天结束（24:00），写成 23:59 更直观。
+      const endText = end >= 1440 ? '23:59' : fmt(end)
+      const days = parseWeekdays(w?.weekdays)
+      const window = { start: fmt(start), end: endText }
+      if (days.length > 0 && days.length < 7) window.days = days
+      daily.push(window)
+    }
+    out.push({
+      id: `trae-${type}-${raw?.id || 'x'}`,
+      kind: 'discount',
+      provider,
+      priority: 100,
+      enabled: true,
+      modelIds: [raw?.id].filter((x) => typeof x === 'string'),
+      label: type === 'off_peak' ? '闲时折扣' : type === 'subsidy' ? '限时优惠' : '',
+      shortLabel: type === 'off_peak' ? '闲时折扣' : '优惠',
+      color: null,
+      activeOnly: false,
+      hover: undefined,
+      actionLabel: undefined,
+      factor,
+      discountedCredits: after !== null ? `x${after}` : null,
+      displayMode: 'replace',
+      schedule: daily.length ? { timezone: tz, daily } : null,
+      active: daily.length ? scheduleActive({ timezone: tz, daily }) : true,
     })
+
+    // 「会员专享 5 折」：`member` 段只给折扣率、没有时段（会员恒享）。
+    // Trae 界面把它与闲时折扣分开列，所以这里也单独一条。
+    const member = d?.data?.member
+    if (member && typeof member === 'object') {
+      const mBefore = Number.isFinite(member.before_consumption_rate) ? member.before_consumption_rate : null
+      const mAfter = Number.isFinite(member.after_consumption_rate) ? member.after_consumption_rate
+        : Number.isFinite(member.consumption_rate) ? member.consumption_rate : null
+      if (mAfter !== null && mBefore !== null && mBefore > 0) {
+        out.push({
+          id: `trae-member-${raw?.id || 'x'}`,
+          kind: 'tier',
+          provider,
+          priority: 90,
+          enabled: true,
+          modelIds: [raw?.id].filter((x) => typeof x === 'string'),
+          label: '会员专享',
+          shortLabel: '会员专享',
+          color: null,
+          activeOnly: false,
+          hover: undefined,
+          actionLabel: undefined,
+          factor: mAfter / mBefore,
+          discountedCredits: `x${mAfter}`,
+          displayMode: 'replace',
+          // 会员价没有时段限制：不写 schedule（渲染时不会伪造时段）。
+          schedule: null,
+          active: true,
+        })
+      }
+    }
+    return out
+  }
+
+  /**
+   * Qoder status 路由模型 → 统一 shape。
+   * `rate` 可能是数字，也可能是展示字符串（`"0.5×"` / `"0.2×"`）——
+   * 两种都要认，否则整批 Qoder 模型会「有 id 却没倍率」。
+   * `isReasoning` 是布尔，不区分档位（阶段由上游声明，这里不猜）。
+   */
+  function normQoder(raw, provider) {
+    const rate = parseRateText(raw?.rate)
+    return {
+      id: raw?.id,
+      /** 全局唯一键：`<provider>::<modelId>`。 */
+      key: `${provider}::${raw?.id}`,
+      name: firstString(raw?.name, raw?.id),
+      provider,
+      credits: rate !== null ? `x${rate}` : null,
+      rate,
+      free: raw?.free === true || rate === 0,
+      badges: [],
+      contextWindow: typeof raw?.contextWindow === 'number' && raw.contextWindow > 0 ? raw.contextWindow : undefined,
+      maxTokens: undefined,
+      supportsImages: false,
+      efforts: [],
+      description: undefined,
+      promotions: qoderDiscountOf(raw, provider),
+    }
+  }
+
+  /**
+   * Qoder 的促销。状态路由目前不透 `promotion`（provide 里有，面板没发），
+   * 有就按统一形状收下，没有就空 —— 不猜。
+   */
+  function qoderDiscountOf(raw, provider) {
+    const p = raw?.promotion
+    if (!p || typeof p !== 'object') return []
+    const norm = normalizePromotion({ ...p, modelIds: p.modelIds || [raw?.id] }, 'discount')
+    if (!norm) return []
+    return [{ ...norm, provider }]
+  }
+
+  // ── 数据源读取 ────────────────────────────────────────────────────────────
+
+  /**
+   * 一次 `/v3/config`。`ua` 决定拿到哪一版行情（见 WB_CATALOG_UA / WB_RICH_UA）。
+   * 所有请求都带硬超时 —— 网关挂住绝不能把路由拖死。
+   */
+  async function fetchV3Config(auth, ua) {
+    const base = auth.global ? WB_BILLING_BASE : WB_CHAT_BASE
+    const headers = {
+      Authorization: `Bearer ${auth.token}`,
+      Accept: 'application/json',
+      'User-Agent': ua,
+      // CN 网关要求同源 Origin/Referer（connect 也是这么发的）。
+      ...(auth.global ? { 'X-Requested-With': 'XMLHttpRequest', 'X-Product': 'SaaS' } : {
+        Origin: WB_BILLING_BASE,
+        Referer: `${WB_BILLING_BASE}/`,
+      }),
+      // connect 在 catalog 请求里也带这几个身份头，缺了可能被判成另一类客户端。
+      ...(auth.uid ? { 'X-User-Id': auth.uid } : {}),
+      ...(auth.domain ? { 'X-Domain': auth.domain } : {}),
+    }
+    const res = await fetch(`${base}/v3/config`, { headers, signal: AbortSignal.timeout(timeoutMs) })
     if (!res.ok) throw new Error(`upstream-http-${res.status}`)
     const body = await res.json()
     if (body?.code !== 0) throw new Error(`upstream-${body?.code}`)
-    return body
+    return body?.data && typeof body.data === 'object' ? body.data : null
   }
 
-  async function fetchUpstream() {
-    const started = Date.now()
-    try {
-      let creds = await detectCredentials()
-      if (creds.length === 0) {
-        state.lastError = 'no-credential'
-        return null
-      }
-      // 优先用上次成功的凭据；超过 CRED_TTL 后重新探测。
-      if (state.credKind && Date.now() - state.credAt < CRED_TTL_MS) {
-        creds = [...creds].sort((a) => (a.kind === state.credKind ? -1 : 0))
-      }
-      for (const cred of creds) {
+  /**
+   * 取某个 WorkBuddy 账号的**富信息**：description / reasoning / promotions / tiers。
+   * 只补元信息，**不参与**模型集合 —— App 视图会多出宿主里并不存在的条目。
+   */
+  async function fetchWorkBuddyRich(n) {
+    const auth = await readWorkBuddyAuth(dshHome(), n)
+    if (!auth) throw new Error('no-credential')
+    const data = await fetchV3Config(auth, WB_RICH_UA)
+    if (!data) throw new Error('empty-payload')
+    const byId = Object.create(null)
+    for (const m of Array.isArray(data.models) ? data.models : []) {
+      if (typeof m?.id === 'string') byId[m.id] = m
+    }
+    // modelPromotions + modelTiers 都拍成同一套促销结构（复用既有归一化）。
+    const promotions = collectPromotions(data)
+    return { byId, promotions }
+  }
+
+  /** 扫描 ~/.dsh/.workbuddy{n}-catalog.json，归一化所有 workbuddy 账号的模型。 */
+  async function readWorkBuddyCatalogs() {
+    const home = dshHome()
+    const models = []
+    const files = await globWorkBuddyCatalogs(home)
+    for (const file of files) {
+      const data = await readJson(file)
+      const entries = data?.entries
+      if (!entries || typeof entries !== 'object') continue
+      const m = file.match(/\.workbuddy(\d+)-catalog\.json$/)
+      const provider = m ? `workbuddy${m[1]}` : 'workbuddy'
+      // 富信息与目录**按同一个 provider 的账号号**配对；失败只是少几个字段。
+      let rich = null
+      if (m && useRich) {
         try {
-          const body = await fetchConfig(cred, USER_AGENT)
-          const agents = Array.isArray(body.data?.agents) ? body.data.agents : []
-          const craftSet = new Set(
-            agents
-              .filter((a) => Array.isArray(a?.modelTags) && a.modelTags.includes('craft'))
-              .flatMap((a) => (Array.isArray(a.models) ? a.models : [])),
-          )
-          const trial = body.data?.productFeaturesConfig?.ModelTrialBanner?.banners?.[0] ?? null
-          const models = (Array.isArray(body.data?.models) ? body.data.models : [])
-            .filter((m) => typeof m?.id === 'string')
-            .map((m) => normalizeModel(m, trial, craftSet))
-          state.credKind = cred.kind
-          state.credAt = Date.now()
-          state.lastError = null
-          // 活动视图是**增强**，不是依赖：失败只留 promoError，目录照常返回。
-          const promotions = await fetchPromotions(cred)
-          return { models, source: cred.kind, promotions }
+          rich = await fetchWorkBuddyRich(m[1])
         } catch (error) {
-          state.lastError = String(error?.message ?? error)
+          rich = null
+          state.richErrors = { ...(state.richErrors || {}), [provider]: String(error?.message ?? error) }
         }
       }
-      return null
-    } finally {
-      state.lastFetchMs = Date.now() - started
+      for (const accountKey of Object.keys(entries)) {
+        const entry = entries[accountKey]
+        const list = Array.isArray(entry?.models) ? entry.models : []
+        for (const raw of list) {
+          if (typeof raw?.id !== 'string') continue
+          const rec = normWorkBuddy(raw, provider, rich?.byId?.[raw.id])
+          // 促销按 id 挂（与 catalog 的模型集合取交集，绝不引入目录外的模型）。
+          if (rich?.promotions?.length) {
+            rec.promotions = rich.promotions.filter((p) => Array.isArray(p.modelIds) && p.modelIds.includes(raw.id))
+          }
+          models.push(rec)
+        }
+      }
     }
+    return models
+  }
+
+  /** 读 ~/.dsh/trae-cn/models.json。 */
+  async function readTraeCatalog() {
+    const data = await readJson(join(dshHome(), 'trae-cn', 'models.json'))
+    const list = Array.isArray(data?.models) ? data.models : []
+    return list
+      .filter((m) => typeof m?.id === 'string')
+      .map((m) => normTrae(m, 'trae'))
+  }
+
+  /** 打 loopback 的 /plugins/dsh-qoder-connect/status，取 Qoder 模型。 */
+  async function fetchQoderStatus() {
+    const base = loopbackBase(web)
+    const res = await fetch(`${base}/plugins/dsh-qoder-connect/status`, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) throw new Error(`qoder-http-${res.status}`)
+    const body = await res.json()
+    const list = Array.isArray(body?.models) ? body.models : []
+    return list
+      .filter((m) => typeof m?.id === 'string')
+      .map((m) => normQoder(m, 'qoder'))
+  }
+
+  /** 汇总所有供应商；单个失败不影响其他。 */
+  async function fetchAll() {
+    const started = Date.now()
+    const models = []
+    const sources = {}
+    const errors = []
+
+    const tasks = [
+      ['workbuddy', readWorkBuddyCatalogs],
+      ['trae', readTraeCatalog],
+      ['qoder', fetchQoderStatus],
+    ]
+    for (const [name, fn] of tasks) {
+      try {
+        const list = await fn()
+        models.push(...list)
+        sources[name] = { ok: true, count: list.length }
+      } catch (error) {
+        sources[name] = { ok: false, error: String(error?.message ?? error) }
+        errors.push(`${name}:${sources[name].error}`)
+      }
+    }
+
+    state.sources = sources
+    state.lastError = errors.length ? errors.join('; ') : null
+    state.lastFetchMs = Date.now() - started
+    if (models.length === 0 && errors.length === tasks.length) return null
+    // 促销条目同时**摊平**到顶层（客户端按 `provider::id` 建索引），
+    // 这样服务端只需发一次；每条都带 modelIds，客户端自己挂。
+    const promotions = []
+    const seen = new Set()
+    for (const m of models) {
+      for (const p of m.promotions || []) {
+        const sig = `${m.provider}|${p.id}`
+        if (seen.has(sig)) continue
+        seen.add(sig)
+        promotions.push({ ...p, provider: m.provider })
+      }
+    }
+    return { models, promotions }
   }
 
   /**
-   * 第二次请求：换 IDE 产品名的 UA，只为取 `modelPromotions` / `modelTiers`。
-   * 该视图的模型集合与宿主可选清单不同源（多出 -ctrl/-b/codewise-* 等），
-   * 所以**绝不**用它替换目录。失败一律静默降级为空数组。
-   */
-  async function fetchPromotions(cred) {
-    if (!usePromotions) return []
-    try {
-      const body = await fetchConfig(cred, PROMO_USER_AGENT)
-      const list = collectPromotions(body.data)
-      state.promoError = null
-      return list
-    } catch (error) {
-      state.promoError = String(error?.message ?? error)
-      // 保留上一次成功的活动数据（如果有），避免一次抖动抹掉徽标。
-      return Array.isArray(state.cache.promotions) ? state.cache.promotions : []
-    }
-  }
-
-  /**
-   * 缓存里的 `active` 是抓取那一刻算的，而夜间窗口的边界是 23:00 / 8:00 ——
-   * 5 分钟缓存足以跨过边界。所以**每次读取都按当前时刻重算**这一位，
-   * 其余字段（文案、倍率、时段定义）沿用缓存，一次都不多打上游。
+   * `active` 是抓取那一刻算的，而夜间窗口的边界是 23:00 / 8:00 ——
+   * 缓存足以跨过边界，所以**每次读取都按当前时刻重算**这一位，
+   * 其余字段（文案、时段定义）沿用缓存，一次都不多打上游。
    */
   function livePromotions() {
     const list = state.cache.promotions
@@ -495,14 +867,12 @@ export function apply(ctx, config = {}) {
       available: state.cache.models !== null,
       cached: true,
       stale: false,
-      source: state.credKind,
-      baseURL,
+      sources: state.sources,
       fetchedAt: state.cache.at,
       ui: ui(),
       health: {
         lastFetchMs: state.lastFetchMs,
         lastError: state.lastError,
-        promoError: state.promoError,
       },
       models: state.cache.models ?? [],
       promotions: livePromotions(),
@@ -512,7 +882,7 @@ export function apply(ctx, config = {}) {
 
   function startRefresh() {
     if (state.inFlight) return state.inFlight
-    state.inFlight = fetchUpstream()
+    state.inFlight = fetchAll()
       .then((result) => {
         if (result) {
           state.cache = {
@@ -534,9 +904,8 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * 有缓存就立即返回缓存快照（后台刷新）；否则进行一次有界的上游尝试。
-   * 绝不等一个挂住的网关：每次 fetch 都带超时。
-  
+   * 有缓存就立即返回缓存快照（后台刷新）；否则进行一次有界的读取。
+   * 绝不等一个挂住的上游：每次 fetch 都带超时。
    */
   async function snapshot(force) {
     const fresh = state.cache.models !== null && Date.now() - state.cache.at < cacheMs
@@ -551,14 +920,12 @@ export function apply(ctx, config = {}) {
         available: false,
         cached: false,
         stale: false,
-        source: state.credKind,
-        baseURL,
+        sources: state.sources,
         fetchedAt: 0,
         ui: ui(),
         health: {
           lastFetchMs: state.lastFetchMs,
           lastError: state.lastError,
-          promoError: state.promoError,
         },
         models: [],
         promotions: [],
@@ -610,6 +977,9 @@ export function apply(ctx, config = {}) {
   // 注册 loopback 路由。`ctx.inject` 会等到 webServer 存在，
   // 因此在没有 web 服务器的环境下加载本插件也是安全的。
   ctx.inject(['webServer'], (wsctx) => {
+    // 记下真实 webServer：Qoder 状态路由的 loopback 请求要用它的 origin，
+    // 而不是猜环境变量（桌面宿主端口是动态的）。
+    web = wsctx.webServer
     wsctx.webServer.register({
       kind: 'exact',
       path: ROUTE,
@@ -639,10 +1009,8 @@ export function apply(ctx, config = {}) {
           cacheAgeMs: state.cache.at ? Date.now() - state.cache.at : null,
           lastFetchMs: state.lastFetchMs,
           lastError: state.lastError,
-          promoError: state.promoError,
           promotions: state.cache.promotions?.length ?? 0,
-          source: state.credKind,
-          baseURL,
+          sources: state.sources,
           inFlight: state.inFlight !== null,
         }
         response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
